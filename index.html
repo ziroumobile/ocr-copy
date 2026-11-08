@@ -36,7 +36,13 @@
     <input id="file" type="file" accept="image/*" hidden>
     <img id="preview" alt="預覽">
     <div class="row">
-      <label>語言
+      <label>引擎
+        <select id="engine">
+          <option value="paddle">高精度（PaddleOCR，建議）</option>
+          <option value="tess">Tesseract（支援日韓）</option>
+        </select>
+      </label>
+      <label class="tess">語言
         <select id="lang">
           <option value="chi_tra+eng">繁體中文 + 英文</option>
           <option value="chi_sim+eng">簡體中文 + 英文</option>
@@ -45,7 +51,7 @@
           <option value="kor+eng">韓文 + 英文</option>
         </select>
       </label>
-      <label>版面
+      <label class="tess">版面
         <select id="psm">
           
           <option value="3">自動（建議）</option>
@@ -55,7 +61,7 @@
       </label>
       <button id="run" class="primary" disabled>開始辨識</button>
     </div>
-    <div class="row">
+    <div class="row tess">
       <label><input type="checkbox" id="pre" checked> 圖片前處理（放大、反相、二值化，建議開啟）</label>
     </div>
     <img id="proc" alt="前處理後" style="max-width:100%;max-height:200px;display:none;margin-top:8px;border-radius:8px">
@@ -102,7 +108,134 @@ document.addEventListener('paste', e => {
 
 const LANG_PATH = 'https://cdn.jsdelivr.net/gh/naptha/tessdata@gh-pages/4.0.0_best';
 const CJK = '　-〿぀-ヿ㐀-鿿＀-￯';
-const CJK_GAP = new RegExp(`(?<=[${CJK}]) +(?=[${CJK}])`, 'g');
+// remove spaces next to CJK characters (OCR engines insert them between characters)
+const CJK_GAP = new RegExp(`[ \t]+(?=[${CJK}])|(?<=[${CJK}])[ \t]+`, 'g');
+const ORT_BASE = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/';
+const MODEL_BASE = 'https://cdn.jsdelivr.net/npm/@gutenye/ocr-models@1.4.2/assets/';
+let paddle;
+
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const el = document.createElement('script');
+    el.src = src; el.onload = res; el.onerror = () => rej(new Error('無法載入 ' + src));
+    document.head.append(el);
+  });
+}
+
+async function loadPaddle() {
+  if (paddle) return paddle;
+  if (!window.ort) await loadScript(ORT_BASE + 'ort.min.js');
+  ort.env.wasm.wasmPaths = ORT_BASE;
+  ort.env.wasm.numThreads = 1;
+  const opt = { executionProviders: ['wasm'] };
+  const [det, rec, dict] = await Promise.all([
+    ort.InferenceSession.create(MODEL_BASE + 'ch_PP-OCRv4_det_infer.onnx', opt),
+    ort.InferenceSession.create(MODEL_BASE + 'ch_PP-OCRv4_rec_infer.onnx', opt),
+    fetch(MODEL_BASE + 'ppocr_keys_v1.txt').then(r => r.text()),
+  ]);
+  const lines = dict.split(String.fromCharCode(10)).map(l => l.trim());
+  if (lines[lines.length - 1] === '') lines.pop();
+  paddle = { det, rec, chars: ['', ...lines, ' '] }; // index 0 = CTC blank
+  return paddle;
+}
+
+// canvas -> Float32 NCHW (BGR), value = (px/255 - mean) / std
+function toTensor(canvas, mean, std) {
+  const { width: w, height: h } = canvas;
+  const px = canvas.getContext('2d').getImageData(0, 0, w, h).data, out = new Float32Array(3 * w * h);
+  for (let i = 0; i < w * h; i++) for (let c = 0; c < 3; c++)
+    out[c * w * h + i] = (px[i * 4 + 2 - c] / 255 - mean[c]) / std[c];
+  return new ort.Tensor('float32', out, [1, 3, h, w]);
+}
+
+function resizedCanvas(src, sx, sy, sw, sh, dw, dh) {
+  const c = document.createElement('canvas'); c.width = dw; c.height = dh;
+  const ctx = c.getContext('2d'); ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(src, sx, sy, sw, sh, 0, 0, dw, dh);
+  return c;
+}
+
+// DB text detection: probability map -> connected regions -> unclipped boxes (original image coords)
+async function detectBoxes(det, full) {
+  const mx = Math.max(full.width, full.height);
+  const ratio = mx > 960 ? 960 / mx : mx < 640 ? 640 / mx : 1;
+  const dw = Math.max(32, Math.round(full.width * ratio / 32) * 32), dh = Math.max(32, Math.round(full.height * ratio / 32) * 32);
+  const input = toTensor(resizedCanvas(full, 0, 0, full.width, full.height, dw, dh), [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]);
+  const res = await det.run({ [det.inputNames[0]]: input });
+  const prob = res[det.outputNames[0]].data, n = dw * dh;
+  const seen = new Uint8Array(n), stack = new Int32Array(n), boxes = [];
+  for (let s = 0; s < n; s++) {
+    if (prob[s] <= 0.3 || seen[s]) continue;
+    let sp = 0, cnt = 0, sum = 0, x0 = dw, x1 = 0, y0 = dh, y1 = 0;
+    stack[sp++] = s; seen[s] = 1;
+    while (sp) {
+      const p = stack[--sp], x = p % dw, y = (p - x) / dw;
+      cnt++; sum += prob[p];
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (const q of [x > 0 ? p - 1 : -1, x < dw - 1 ? p + 1 : -1, y > 0 ? p - dw : -1, y < dh - 1 ? p + dw : -1])
+        if (q >= 0 && prob[q] > 0.3 && !seen[q]) { seen[q] = 1; stack[sp++] = q; }
+    }
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+    if (Math.min(bw, bh) < 3 || sum / cnt < 0.6) continue;
+    const d = bw * bh * 1.5 / (2 * (bw + bh)); // DB unclip
+    boxes.push({
+      x0: Math.max(0, (x0 - d) / dw * full.width), x1: Math.min(full.width, (x1 + 1 + d) / dw * full.width),
+      y0: Math.max(0, (y0 - d) / dh * full.height), y1: Math.min(full.height, (y1 + 1 + d) / dh * full.height),
+    });
+  }
+  return boxes;
+}
+
+async function recognizeBox(rec, chars, full, b) {
+  const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
+  const w = Math.min(2000, Math.max(16, Math.ceil(48 * bw / bh)));
+  const input = toTensor(resizedCanvas(full, b.x0, b.y0, bw, bh, w, 48), [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]);
+  const res = await rec.run({ [rec.inputNames[0]]: input });
+  const o = res[rec.outputNames[0]], [, T, C] = o.dims;
+  let text = '', last = 0;
+  for (let t = 0; t < T; t++) {
+    let best = 0, bv = -Infinity;
+    for (let c = 0; c < C; c++) { const v = o.data[t * C + c]; if (v > bv) { bv = v; best = c; } }
+    if (best !== 0 && best !== last) text += chars[best] ?? '';
+    last = best;
+  }
+  return text;
+}
+
+async function paddleOcr(file, onProgress) {
+  const { det, rec, chars } = await loadPaddle();
+  const bmp = await createImageBitmap(file);
+  const full = document.createElement('canvas'); full.width = bmp.width; full.height = bmp.height;
+  full.getContext('2d').drawImage(bmp, 0, 0);
+  const boxes = await detectBoxes(det, full);
+  boxes.sort((a, b) => a.y0 - b.y0);
+  // group boxes into lines by vertical overlap
+  const lines = [];
+  for (const b of boxes) {
+    const cy = (b.y0 + b.y1) / 2, h = b.y1 - b.y0;
+    const line = lines.find(l => Math.abs(l.cy - cy) < Math.min(l.h, h) * 0.5);
+    if (line) { line.items.push(b); line.cy = (line.cy + cy) / 2; line.h = Math.max(line.h, h); }
+    else lines.push({ cy, h, items: [b] });
+  }
+  let done = 0; const outLines = [];
+  for (const l of lines) {
+    l.items.sort((a, b) => a.x0 - b.x0);
+    const parts = [];
+    for (const b of l.items) {
+      parts.push(await recognizeBox(rec, chars, full, b));
+      onProgress(++done / boxes.length);
+    }
+    outLines.push(parts.filter(Boolean).join(' '));
+  }
+  return outLines.join('\n');
+}
+
+function syncEngine() {
+  document.querySelectorAll('.tess').forEach(el => el.style.display = $('engine').value === 'tess' ? '' : 'none');
+  if ($('engine').value === 'paddle') $('proc').style.display = 'none';
+}
+$('engine').onchange = syncEngine;
+syncEngine();
 
 // Upscale, grayscale, Otsu-binarize; output is always black text on white.
 async function preprocess(file) {
@@ -178,9 +311,16 @@ run.onclick = async () => {
   if (!image) return;
   run.disabled = true;
   bar.style.display = 'block'; bar.value = 0;
-  status.textContent = '載入中…（首次使用需下載語言資料，約數十 MB）';
+  status.textContent = '載入中…（首次使用需下載模型，約 15–30 MB）';
   let worker;
   try {
+    if ($('engine').value === 'paddle') {
+      const text = await paddleOcr(image, p => { bar.value = p; status.textContent = `辨識中 ${Math.round(p * 100)}%`; });
+      out.value = text.replace(CJK_GAP, '').trim();
+      status.textContent = out.value ? '完成' : '沒有辨識到文字';
+      copyBtn.disabled = clearBtn.disabled = !out.value;
+      return;
+    }
     let input = image;
     if ($('pre').checked) {
       input = await preprocess(image);
