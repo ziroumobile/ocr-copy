@@ -45,8 +45,20 @@
           <option value="kor+eng">韓文 + 英文</option>
         </select>
       </label>
+      <label>版面
+        <select id="psm">
+          
+          <option value="3">自動（建議）</option>
+          <option value="6">單一文字區塊</option>
+          <option value="7">單行</option>
+        </select>
+      </label>
       <button id="run" class="primary" disabled>開始辨識</button>
     </div>
+    <div class="row">
+      <label><input type="checkbox" id="pre" checked> 圖片前處理（放大、反相、二值化，建議開啟）</label>
+    </div>
+    <img id="proc" alt="前處理後" style="max-width:100%;max-height:200px;display:none;margin-top:8px;border-radius:8px">
     <progress id="bar" max="1" value="0"></progress>
     <div id="status"></div>
   </div>
@@ -88,13 +100,94 @@ document.addEventListener('paste', e => {
   if (item) setImage(item.getAsFile());
 });
 
+const LANG_PATH = 'https://cdn.jsdelivr.net/gh/naptha/tessdata@gh-pages/4.0.0_best';
+const CJK = '　-〿぀-ヿ㐀-鿿＀-￯';
+const CJK_GAP = new RegExp(`(?<=[${CJK}]) +(?=[${CJK}])`, 'g');
+
+// Upscale, grayscale, Otsu-binarize; output is always black text on white.
+async function preprocess(file) {
+  const bmp = await createImageBitmap(file);
+  const scale = Math.min(3, Math.max(1, 1000 / Math.max(bmp.width, bmp.height))); // only upscale small images
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bmp, 0, 0, c.width, c.height);
+  const img = ctx.getImageData(0, 0, c.width, c.height), d = img.data, n = c.width * c.height;
+  const g = new Uint8Array(n), hist = new Array(256).fill(0);
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const v = (d[i*4] * 0.299 + d[i*4+1] * 0.587 + d[i*4+2] * 0.114) | 0;
+    g[i] = v; hist[v]++; sum += v;
+  }
+  let sumB = 0, wB = 0, best = 0, thr = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t]; if (!wB) continue;
+    const wF = n - wB; if (!wF) break;
+    sumB += t * hist[t];
+    const between = wB * wF * (sumB / wB - (sum - sumB) / wF) ** 2;
+    if (between > best) { best = between; thr = t; }
+  }
+  let dark = 0; for (let i = 0; i < n; i++) if (g[i] <= thr) dark++;
+  const darkBg = dark > n / 2; // majority dark => background dark, text is light
+  // box mean via integral image: small radius denoises grain, large radius gives local threshold
+  const W = c.width, H = c.height, I = new Float64Array((W + 1) * (H + 1));
+  for (let y = 0; y < H; y++) {
+    let row = 0;
+    for (let x = 0; x < W; x++) { row += g[y*W+x]; I[(y+1)*(W+1)+x+1] = I[y*(W+1)+x+1] + row; }
+  }
+  const mean = (x, y, r) => {
+    const x0 = Math.max(0, x - r), x1 = Math.min(W, x + r + 1), y0 = Math.max(0, y - r), y1 = Math.min(H, y + r + 1);
+    return (I[y1*(W+1)+x1] - I[y0*(W+1)+x1] - I[y1*(W+1)+x0] + I[y0*(W+1)+x0]) / ((x1-x0) * (y1-y0));
+  };
+  const bin = new Uint8Array(n), r = Math.max(2, Math.round(scale * 2));
+  const R = Math.max(40, Math.round(Math.max(W, H) / 10));
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const v = mean(x, y, r), m = mean(x, y, R);
+    const isText = darkBg ? v > m + 12 : v < m - 12;
+    bin[y*W+x] = isText ? 1 : 0;
+  }
+  // drop speckles: connected text-pixel blobs smaller than minArea
+  const minArea = Math.max(20, Math.round(n / 20000)), stack = new Int32Array(n), list = new Int32Array(n), seen = new Uint8Array(n);
+  let ptr = 0;
+  for (let s = 0; s < n; s++) {
+    if (!bin[s] || seen[s]) continue;
+    let sp = 0, cnt = 0; stack[sp++] = s; seen[s] = 1;
+    let x0 = W, x1 = 0, y0 = H, y1 = 0;
+    const start = ptr;
+    while (sp) {
+      const p = stack[--sp]; cnt++; list[ptr++] = p;
+      const px = p % W, py = (p - px) / W;
+      if (px < x0) x0 = px; if (px > x1) x1 = px; if (py < y0) y0 = py; if (py > y1) y1 = py;
+      for (const q of [px > 0 ? p - 1 : -1, px < W - 1 ? p + 1 : -1, p >= W ? p - W : -1, p < n - W ? p + W : -1])
+        if (q >= 0 && bin[q] && !seen[q]) { seen[q] = 1; stack[sp++] = q; }
+    }
+    // remove tiny specks, and big sparse clusters (grain/vignette) that are far less dense than any glyph
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+    const sparse = (bw > W / 4 || bh > H / 4) && cnt / (bw * bh) < 0.25;
+    if (cnt < minArea || sparse) for (let k = start; k < ptr; k++) bin[list[k]] = 0;
+  }
+  for (let i = 0; i < n; i++) {
+    d[i*4] = d[i*4+1] = d[i*4+2] = bin[i] ? 0 : 255; d[i*4+3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
 run.onclick = async () => {
   if (!image) return;
   run.disabled = true;
   bar.style.display = 'block'; bar.value = 0;
-  status.textContent = '載入中…（首次使用需下載語言資料）';
+  status.textContent = '載入中…（首次使用需下載語言資料，約數十 MB）';
+  let worker;
   try {
-    const { data } = await Tesseract.recognize(image, $('lang').value, {
+    let input = image;
+    if ($('pre').checked) {
+      input = await preprocess(image);
+      $('proc').src = input.toDataURL(); $('proc').style.display = 'block';
+    } else $('proc').style.display = 'none';
+    worker = await Tesseract.createWorker($('lang').value, 1, {
+      langPath: LANG_PATH,
       logger: m => {
         if (m.status === 'recognizing text') {
           bar.value = m.progress;
@@ -102,12 +195,15 @@ run.onclick = async () => {
         }
       }
     });
-    out.value = data.text.trim();
+    await worker.setParameters({ tessedit_pageseg_mode: $('psm').value });
+    const { data } = await worker.recognize(input);
+    out.value = data.text.replace(CJK_GAP, '').trim();
     status.textContent = out.value ? '完成' : '沒有辨識到文字';
     copyBtn.disabled = clearBtn.disabled = !out.value;
   } catch (err) {
     status.textContent = '辨識失敗：' + err.message;
   } finally {
+    if (worker) worker.terminate();
     run.disabled = false;
     bar.style.display = 'none';
   }
