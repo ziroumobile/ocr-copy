@@ -67,6 +67,9 @@
       </label>
       <button id="run" class="primary" disabled>開始辨識</button>
     </div>
+    <div class="row">
+      <label><input type="checkbox" id="trad" checked> 輸出轉為繁體中文（修正模型誤輸出的簡體字）</label>
+    </div>
     <div class="row tess">
       <label><input type="checkbox" id="pre" checked> 圖片前處理（放大、反相、二值化，建議開啟）</label>
     </div>
@@ -251,6 +254,19 @@ async function paddleOcr(file, onProgress) {
   return outLines.join(String.fromCharCode(10));
 }
 
+let toTrad;
+async function finalize(text) {
+  text = text.replace(CJK_GAP, '').trim();
+  if (!$('trad').checked) return text;
+  try {
+    if (!toTrad) {
+      if (!window.OpenCC) await loadScript('https://cdn.jsdelivr.net/npm/opencc-js@1.0.5/dist/umd/full.js');
+      toTrad = OpenCC.Converter({ from: 'cn', to: 'tw' });
+    }
+    return toTrad(text);
+  } catch { return text; } // conversion is best-effort
+}
+
 function syncEngine() {
   document.querySelectorAll('.tess').forEach(el => el.style.display = $('engine').value === 'tess' ? '' : 'none');
   if ($('engine').value === 'paddle') $('proc').style.display = 'none';
@@ -337,7 +353,7 @@ run.onclick = async () => {
   try {
     if ($('engine').value === 'paddle') {
       const text = await paddleOcr(image, p => { bar.value = p; status.textContent = `辨識中 ${Math.round(p * 100)}%`; });
-      out.value = text.replace(CJK_GAP, '').trim();
+      out.value = await finalize(text);
       status.textContent = out.value ? '完成' : '沒有辨識到文字';
       copyBtn.disabled = clearBtn.disabled = !out.value;
       return;
@@ -358,7 +374,7 @@ run.onclick = async () => {
     });
     await worker.setParameters({ tessedit_pageseg_mode: $('psm').value });
     const { data } = await worker.recognize(input);
-    out.value = data.text.replace(CJK_GAP, '').trim();
+    out.value = await finalize(data.text);
     status.textContent = out.value ? '完成' : '沒有辨識到文字';
     copyBtn.disabled = clearBtn.disabled = !out.value;
   } catch (err) {
