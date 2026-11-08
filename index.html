@@ -23,6 +23,7 @@
   button:disabled { opacity:.5; }
   progress { width:100%; height:8px; display:none; margin-top:12px; }
   #status { color:var(--muted); font-size:.9rem; margin-top:8px; min-height:1.2em; }
+  input[type=password], input[type=text] { font:inherit; padding:8px 10px; border-radius:8px; border:1px solid var(--border); background:var(--card); color:var(--text); width:15em; max-width:100%; }
   textarea { width:100%; min-height:220px; padding:12px; font:inherit; line-height:1.5; border:1px solid var(--border); border-radius:8px; background:var(--card); color:var(--text); resize:vertical; }
   .hint { color:var(--muted); font-size:.85rem; }
 </style>
@@ -39,6 +40,7 @@
       <label>引擎
         <select id="engine">
           <option value="paddle">高精度（PaddleOCR，建議）</option>
+          <option value="claude">Claude（手寫／古籍最準，需 API Key）</option>
           <option value="tess">Tesseract（支援日韓）</option>
         </select>
       </label>
@@ -67,6 +69,18 @@
       </label>
       <button id="run" class="primary" disabled>開始辨識</button>
     </div>
+    <div class="row claude">
+      <label>模型
+        <select id="cmodel">
+          <option value="claude-sonnet-5-5">Sonnet 5.5（建議）</option>
+          <option value="claude-opus-5-5">Opus 5.5（最準、最貴）</option>
+          <option value="claude-haiku-5-5">Haiku 5.5（最便宜）</option>
+        </select>
+      </label>
+      <label>API Key <input id="apikey" type="password" placeholder="sk-ant-..." autocomplete="off"></label>
+      <button id="clearkey" type="button">清除金鑰</button>
+    </div>
+    <div class="hint claude">金鑰只存在這個瀏覽器，不會上傳到 GitHub。選此引擎時，圖片會送到 Anthropic 並依用量計費；金鑰在網頁裡可被看到，請只自己使用。</div>
     <div class="row">
       <label><input type="checkbox" id="trad" checked> 輸出轉為繁體中文（修正模型誤輸出的簡體字）</label>
     </div>
@@ -349,6 +363,53 @@ async function paddleOcr(file, onProgress) {
   return outLines.join(String.fromCharCode(10));
 }
 
+const KEY_STORE = 'ocr-anthropic-key';
+function getKey() { try { return localStorage.getItem(KEY_STORE) || ''; } catch { return ''; } }
+function setKey(v) { try { v ? localStorage.setItem(KEY_STORE, v) : localStorage.removeItem(KEY_STORE); } catch {} }
+$('apikey').value = getKey();
+$('clearkey').onclick = () => { $('apikey').value = ''; setKey(''); };
+
+async function imageToJpegBase64(file) {
+  const bmp = await createImageBitmap(file);
+  const k = Math.min(1, 1568 / Math.max(bmp.width, bmp.height)); // API's useful max long side
+  const c = document.createElement('canvas'); c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+  const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(bmp, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.92).split(',')[1];
+}
+
+async function claudeOcr(file) {
+  const key = $('apikey').value.trim();
+  if (!key) throw new Error('請先輸入 Anthropic API Key');
+  setKey(key);
+  const vertical = $('dir').value === 'v';
+  const prompt = '請逐字抄錄這張圖片中的所有文字，只輸出文字本身，不要任何說明或前後綴。' +
+    '保持原本使用的字體（繁體就用繁體，不要擅自轉成簡體，也不要把異體字或古字改成現代字）和標點。' +
+    (vertical ? '文字是直排，請依閱讀順序（由右到左，每一欄由上到下）輸出，每一欄獨立一行。'
+              : '依閱讀順序輸出，每一行文字獨立一行。') +
+    '看不清楚的字請盡量根據上下文判斷；實在無法辨識的字用「□」代替。';
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model: $('cmodel').value, max_tokens: 4096,
+      messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: await imageToJpegBase64(file) } },
+        { type: 'text', text: prompt },
+      ] }],
+    }),
+  });
+  if (!res.ok) {
+    let msg = ''; try { msg = (await res.json()).error.message; } catch {}
+    throw new Error(`API 錯誤 ${res.status}${msg ? '：' + msg : ''}`);
+  }
+  const j = await res.json();
+  return j.content.filter(b => b.type === 'text').map(b => b.text).join('');
+}
+
 let toTrad;
 async function finalize(text) {
   text = text.replace(CJK_GAP, '').trim();
@@ -364,6 +425,7 @@ async function finalize(text) {
 
 function syncEngine() {
   document.querySelectorAll('.tess').forEach(el => el.style.display = $('engine').value === 'tess' ? '' : 'none');
+  document.querySelectorAll('.claude').forEach(el => el.style.display = $('engine').value === 'claude' ? '' : 'none');
   if ($('engine').value === 'paddle') $('proc').style.display = 'none';
 }
 $('engine').onchange = syncEngine;
@@ -446,6 +508,13 @@ run.onclick = async () => {
   status.textContent = '載入中…（首次使用需下載模型，約 15–30 MB）';
   let worker;
   try {
+    if ($('engine').value === 'claude') {
+      bar.removeAttribute('value'); status.textContent = '已送出，等待 Claude 回應…';
+      out.value = await finalize(await claudeOcr(image));
+      status.textContent = out.value ? '完成' : '沒有辨識到文字';
+      copyBtn.disabled = clearBtn.disabled = !out.value;
+      return;
+    }
     if ($('engine').value === 'paddle') {
       const text = await paddleOcr(image, p => { bar.value = p; status.textContent = `辨識中 ${Math.round(p * 100)}%`; });
       out.value = await finalize(text);
