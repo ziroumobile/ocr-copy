@@ -42,6 +42,12 @@
           <option value="tess">Tesseract（支援日韓）</option>
         </select>
       </label>
+      <label>文字方向
+        <select id="dir">
+          <option value="h">橫排</option>
+          <option value="v">直排（由右到左）</option>
+        </select>
+      </label>
       <label class="tess">語言
         <select id="lang">
           <option value="chi_tra+eng">繁體中文 + 英文</option>
@@ -186,10 +192,22 @@ async function detectBoxes(det, full) {
   return boxes;
 }
 
-async function recognizeBox(rec, chars, full, b) {
+// vertical column -> cut into square-ish cells and lay them side by side so glyphs stay upright
+function stitchColumn(full, b) {
+  const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
+  const n = Math.max(1, Math.round(bh / bw)), seg = bh / n, cell = Math.max(8, Math.round(48 * bw / seg));
+  const c = document.createElement('canvas'); c.width = Math.min(2000, n * cell); c.height = 48;
+  const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, 48);
+  ctx.imageSmoothingQuality = 'high';
+  for (let i = 0; i < n; i++) ctx.drawImage(full, b.x0, b.y0 + i * seg, bw, seg, i * cell, 0, cell, 48);
+  return c;
+}
+
+async function recognizeBox(rec, chars, full, b, vertical) {
   const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
   const w = Math.min(2000, Math.max(16, Math.ceil(48 * bw / bh)));
-  const input = toTensor(resizedCanvas(full, b.x0, b.y0, bw, bh, w, 48), [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]);
+  const img = vertical && bh > bw * 1.2 ? stitchColumn(full, b) : resizedCanvas(full, b.x0, b.y0, bw, bh, w, 48);
+  const input = toTensor(img, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]);
   const res = await rec.run({ [rec.inputNames[0]]: input });
   const o = res[rec.outputNames[0]], [, T, C] = o.dims;
   let text = '', last = 0;
@@ -208,26 +226,29 @@ async function paddleOcr(file, onProgress) {
   const full = document.createElement('canvas'); full.width = bmp.width; full.height = bmp.height;
   full.getContext('2d').drawImage(bmp, 0, 0);
   const boxes = await detectBoxes(det, full);
-  boxes.sort((a, b) => a.y0 - b.y0);
-  // group boxes into lines by vertical overlap
+  const vertical = $('dir').value === 'v';
+  // horizontal: group boxes into rows by vertical overlap; vertical: group into columns by horizontal overlap
+  const lo = vertical ? 'x0' : 'y0', hi = vertical ? 'x1' : 'y1', alo = vertical ? 'y0' : 'x0';
+  boxes.sort((a, b) => a[lo] - b[lo]);
   const lines = [];
   for (const b of boxes) {
-    const cy = (b.y0 + b.y1) / 2, h = b.y1 - b.y0;
-    const line = lines.find(l => Math.abs(l.cy - cy) < Math.min(l.h, h) * 0.5);
-    if (line) { line.items.push(b); line.cy = (line.cy + cy) / 2; line.h = Math.max(line.h, h); }
-    else lines.push({ cy, h, items: [b] });
+    const c = (b[lo] + b[hi]) / 2, sz = b[hi] - b[lo];
+    const line = lines.find(l => Math.abs(l.c - c) < Math.min(l.sz, sz) * 0.5);
+    if (line) { line.items.push(b); line.c = (line.c + c) / 2; line.sz = Math.max(line.sz, sz); }
+    else lines.push({ c, sz, items: [b] });
   }
+  if (vertical) lines.sort((a, b) => b.c - a.c); // columns read right to left
   let done = 0; const outLines = [];
   for (const l of lines) {
-    l.items.sort((a, b) => a.x0 - b.x0);
+    l.items.sort((a, b) => a[alo] - b[alo]);
     const parts = [];
     for (const b of l.items) {
-      parts.push(await recognizeBox(rec, chars, full, b));
+      parts.push(await recognizeBox(rec, chars, full, b, vertical));
       onProgress(++done / boxes.length);
     }
-    outLines.push(parts.filter(Boolean).join(' '));
+    outLines.push(parts.filter(Boolean).join(vertical ? '' : ' '));
   }
-  return outLines.join('\n');
+  return outLines.join(String.fromCharCode(10));
 }
 
 function syncEngine() {
