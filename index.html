@@ -195,21 +195,114 @@ async function detectBoxes(det, full) {
   return boxes;
 }
 
-// vertical column -> cut into square-ish cells and lay them side by side so glyphs stay upright
-function stitchColumn(full, b) {
-  const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
-  const n = Math.max(1, Math.round(bh / bw)), seg = bh / n, cell = Math.max(8, Math.round(48 * bw / seg));
-  const c = document.createElement('canvas'); c.width = Math.min(2000, n * cell); c.height = 48;
+// Vertical layout: split into columns by ink projection, then cut each column into character cells.
+async function segmentVertical(full, boxes) {
+  const tall = boxes.filter(b => b.y1 - b.y0 > (b.x1 - b.x0) * 1.3).map(b => b.x1 - b.x0).sort((a, b) => a - b);
+  const widths = tall.length ? tall : boxes.map(b => Math.min(b.x1 - b.x0, b.y1 - b.y0)).sort((a, b) => a - b);
+  if (!widths.length) return [];
+  const cw = widths[widths.length >> 1] * 0.85; // rough glyph width (detection boxes are slightly inflated)
+  const ink = await preprocess(full), s = ink.width / full.width, W = ink.width, H = ink.height;
+  const px = ink.getContext('2d').getImageData(0, 0, W, H).data;
+  const mask = new Uint8Array(W * H);
+  for (const b of boxes) for (let y = Math.max(0, Math.floor(b.y0 * s)); y < Math.min(H, Math.ceil(b.y1 * s)); y++)
+    for (let x = Math.max(0, Math.floor(b.x0 * s)); x < Math.min(W, Math.ceil(b.x1 * s)); x++)
+      if (px[(y * W + x) * 4] === 0) mask[y * W + x] = 1;
+  const smooth = (arr, r) => {
+    const out = new Float32Array(arr.length); let acc = 0;
+    for (let i = 0; i < arr.length + r; i++) {
+      if (i < arr.length) acc += arr[i];
+      if (i - 2 * r - 1 >= 0) acc -= arr[i - 2 * r - 1];
+      const c = i - r; if (c >= 0 && c < arr.length) out[c] = acc / (2 * r + 1);
+    }
+    return out;
+  };
+  const projX = new Float32Array(W);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) projX[x] += mask[y * W + x];
+  const sx = smooth(projX, Math.max(1, Math.round(cw * s * 0.1)));
+  const maxX = Math.max(...sx);
+  // column pitch: autocorrelation of the horizontal profile (ruled/regular columns), else the box-based guess
+  let cwS = cw * s;
+  if (tall.length >= 6) { // needs several columns to be a reliable signal
+    let mu = 0; for (let x = 0; x < W; x++) mu += sx[x]; mu /= W;
+    let v0 = 0; for (let x = 0; x < W; x++) v0 += (sx[x] - mu) ** 2;
+    let bestR = 0.25;
+    for (let lag = Math.round(cwS * 0.5); lag <= Math.min(W >> 1, Math.round(cwS * 1.6)) && v0 > 0; lag++) {
+      let r = 0; for (let x = 0; x + lag < W; x++) r += (sx[x] - mu) * (sx[x + lag] - mu);
+      if (r / v0 > bestR) { bestR = r / v0; cwS = lag; }
+    }
+  }
+  let bands = [], start = -1;
+  for (let x = 0; x <= W; x++) {
+    const on = x < W && sx[x] > maxX * 0.12;
+    if (on && start < 0) start = x;
+    if (!on && start >= 0) { bands.push([start, x]); start = -1; }
+  }
+  const merged = [];
+  for (const b of bands) {
+    const last = merged[merged.length - 1];
+    if (last && b[0] - last[1] < cwS * 0.25) last[1] = b[1]; else merged.push([...b]);
+  }
+  bands = [];
+  for (const [a, b] of merged) {
+    if (b - a < cwS * 0.3) continue;
+    const k = Math.max(1, Math.round((b - a) / cwS)); // merged neighbours: split evenly
+    for (let i = 0; i < k; i++) bands.push([a + (b - a) * i / k, a + (b - a) * (i + 1) / k]);
+  }
+  bands.reverse(); // right to left
+  const cols = [];
+  for (const [a, b] of bands) {
+    const x0 = Math.max(0, Math.floor(a - cwS * 0.1)), x1 = Math.min(W, Math.ceil(b + cwS * 0.1));
+    const projY = new Float32Array(H);
+    for (let y = 0; y < H; y++) for (let x = Math.floor(a); x < Math.ceil(b); x++) projY[y] += mask[y * W + Math.min(W - 1, x)];
+    const sy = smooth(projY, Math.max(1, Math.round(cwS * 0.06))), maxY = Math.max(...sy);
+    if (maxY === 0) continue;
+    let y0 = 0, y1 = H - 1;
+    while (y0 < H && sy[y0] < maxY * 0.05) y0++;
+    while (y1 > y0 && sy[y1] < maxY * 0.05) y1--;
+    // character pitch: start from the column's ink width, refine with the autocorrelation of the vertical profile
+    const pw = Math.min(Math.max(b - a, cwS * 0.7), cwS * 1.4);
+    let pitch = pw, bestR = 0.2;
+    {
+      let mu = 0; for (let y = y0; y <= y1; y++) mu += sy[y]; mu /= (y1 - y0 + 1);
+      let v0 = 0; for (let y = y0; y <= y1; y++) v0 += (sy[y] - mu) ** 2;
+      for (let lag = Math.round(pw * 0.7); lag <= Math.round(pw * 1.4) && v0 > 0; lag++) {
+        let r = 0; for (let y = y0; y + lag <= y1; y++) r += (sy[y] - mu) * (sy[y + lag] - mu);
+        if (r / v0 > bestR) { bestR = r / v0; pitch = lag; }
+      }
+    }
+    const n = Math.max(1, Math.round((y1 - y0 + 1) / pitch)), seg = (y1 - y0 + 1) / n;
+    let meanY = 0; for (let y = y0; y <= y1; y++) meanY += sy[y]; meanY /= (y1 - y0 + 1);
+    const cuts = [y0];
+    for (let i = 1; i < n; i++) { // snap each cut to the emptiest row near the even split
+      const t = y0 + i * seg; let best = Math.round(t), bv = Infinity;
+      for (let y = Math.round(t - seg * 0.3); y <= Math.round(t + seg * 0.3); y++)
+        if (y > cuts[cuts.length - 1] + 2 && y < y1 && sy[y] < bv) { bv = sy[y]; best = y; }
+      cuts.push(bv < meanY * 0.5 ? best : Math.round(t)); // only snap to a clear gap
+    }
+    cuts.push(y1 + 1);
+    cols.push({ x0: x0 / s, x1: x1 / s, cuts: cuts.map(c => c / s) });
+  }
+  return cols;
+}
+
+// stitch a column's character cells side by side at height 48 so glyphs stay upright
+function stitchCells(full, col) {
+  const cw = col.x1 - col.x0, n = col.cuts.length - 1;
+  const cellW = Math.max(8, Math.round(48 * cw / ((col.cuts[n] - col.cuts[0]) / n)));
+  const c = document.createElement('canvas'); c.width = Math.min(2000, n * cellW); c.height = 48;
   const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, 48);
   ctx.imageSmoothingQuality = 'high';
-  for (let i = 0; i < n; i++) ctx.drawImage(full, b.x0, b.y0 + i * seg, bw, seg, i * cell, 0, cell, 48);
+  for (let i = 0; i < n; i++)
+    ctx.drawImage(full, col.x0, col.cuts[i], cw, col.cuts[i + 1] - col.cuts[i], i * cellW, 0, cellW, 48);
   return c;
 }
 
-async function recognizeBox(rec, chars, full, b, vertical) {
+async function recognizeBox(rec, chars, full, b) {
   const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
-  const w = Math.min(2000, Math.max(16, Math.ceil(48 * bw / bh)));
-  const img = vertical && bh > bw * 1.2 ? stitchColumn(full, b) : resizedCanvas(full, b.x0, b.y0, bw, bh, w, 48);
+  return recognizeCanvas(rec, chars, resizedCanvas(full, b.x0, b.y0, bw, bh, Math.min(2000, Math.max(16, Math.ceil(48 * bw / bh))), 48));
+}
+
+async function recognizeCanvas(rec, chars, img) {
   const input = toTensor(img, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]);
   const res = await rec.run({ [rec.inputNames[0]]: input });
   const o = res[rec.outputNames[0]], [, T, C] = o.dims;
@@ -229,27 +322,29 @@ async function paddleOcr(file, onProgress) {
   const full = document.createElement('canvas'); full.width = bmp.width; full.height = bmp.height;
   full.getContext('2d').drawImage(bmp, 0, 0);
   const boxes = await detectBoxes(det, full);
-  const vertical = $('dir').value === 'v';
-  // horizontal: group boxes into rows by vertical overlap; vertical: group into columns by horizontal overlap
-  const lo = vertical ? 'x0' : 'y0', hi = vertical ? 'x1' : 'y1', alo = vertical ? 'y0' : 'x0';
+  if ($('dir').value === 'v') {
+    const cols = await segmentVertical(full, boxes), texts = [];
+    for (const col of cols) { texts.push(await recognizeCanvas(rec, chars, stitchCells(full, col))); onProgress(texts.length / cols.length); }
+    return texts.join(String.fromCharCode(10));
+  }
+  const lo = 'y0', hi = 'y1', alo = 'x0';
   boxes.sort((a, b) => a[lo] - b[lo]);
   const lines = [];
   for (const b of boxes) {
     const c = (b[lo] + b[hi]) / 2, sz = b[hi] - b[lo];
-    const line = lines.find(l => Math.abs(l.c - c) < Math.min(l.sz, sz) * 0.5);
+    const line = lines.find(l => Math.abs(l.c - c) < Math.max(l.sz, sz) * 0.5);
     if (line) { line.items.push(b); line.c = (line.c + c) / 2; line.sz = Math.max(line.sz, sz); }
     else lines.push({ c, sz, items: [b] });
   }
-  if (vertical) lines.sort((a, b) => b.c - a.c); // columns read right to left
-  let done = 0; const outLines = [];
+    let done = 0; const outLines = [];
   for (const l of lines) {
     l.items.sort((a, b) => a[alo] - b[alo]);
     const parts = [];
     for (const b of l.items) {
-      parts.push(await recognizeBox(rec, chars, full, b, vertical));
+      parts.push(await recognizeBox(rec, chars, full, b));
       onProgress(++done / boxes.length);
     }
-    outLines.push(parts.filter(Boolean).join(vertical ? '' : ' '));
+    outLines.push(parts.filter(Boolean).join(' '));
   }
   return outLines.join(String.fromCharCode(10));
 }
